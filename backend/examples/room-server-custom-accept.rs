@@ -6,26 +6,17 @@
 //!
 //! You can test this out by running:
 //!
-//!     cargo run --example server 127.0.0.1:12345
+//!     cargo run --example room-server-custom-accept 127.0.0.1:12345
 //!
 //! And then in another window run:
 //!
-//!     cargo run --example client ws://127.0.0.1:12345/socket
+//!     cargo run --example client ws://127.0.0.1:12345/socket?name=test&transcribe_to=jp&translate_to=en
 //!
 //! You can run the second command in multiple windows and then chat between the
 //! two, seeing the messages from the other client as they're received. For all
 //! connected clients they'll all join the same room and see everyone else's
 //! messages.
 
-use std::{
-    collections::HashMap,
-    convert::Infallible,
-    env,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
-use base64::engine::general_purpose;
-use serde_json::Value;
 use hyper::{
     body::Incoming,
     header::{
@@ -35,9 +26,17 @@ use hyper::{
     server::conn::http1,
     service::service_fn,
     upgrade::Upgraded,
-    Method, Request, Response, StatusCode, Version,
+    Method, Request, Response, StatusCode,
 };
 use hyper_util::rt::TokioIo;
+use serde_json::json;
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    env,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 use tokio::net::TcpListener;
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
@@ -52,12 +51,20 @@ use tokio_tungstenite::{
 };
 
 type Tx = UnboundedSender<Message>;
-type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
 type Body = http_body_util::Full<hyper::body::Bytes>;
-use base64::{engine::general_purpose::STANDARD, Engine};
-use url::form_urlencoded;
+use url::{form_urlencoded, Url};
+struct PartialParticipant {
+    name: String,
+    transcribe_to: String,
+    translate_to: String,
+}
+
+#[derive(Clone)]
 struct Participant {
     name: String,
+    _transcribe_to: String,
+    _translate_to: String,
+    sender: Tx,
 }
 
 type RoomName = String;
@@ -66,31 +73,113 @@ type RoomParticipants = HashMap<SocketAddr, Participant>;
 
 type RoomMap = Arc<Mutex<HashMap<RoomName, RoomParticipants>>>;
 
+/// Collect senders for a room without holding the lock while sending
+fn collect_room_senders(room_id: &str, room_map: &RoomMap) -> Vec<Tx> {
+    let map = room_map.lock().unwrap();
+    map.get(room_id)
+        .map(|peers| peers.values().map(|p| p.sender.clone()).collect())
+        .unwrap_or_default()
+}
 
+fn broadcast_ws_handshake_success(participant: Participant) {
+    let msg = json!({
+        "type": "message",
+        "is_success": true,
+        "message": "successfully established handshake"
+    })
+    .to_string();
+
+    let _ = participant.sender.unbounded_send(Message::Text(msg.clone().into()));
+}
+
+fn broadcast_room_participants(room_id: &str, room_map: &RoomMap) {
+    let (list, senders): (Vec<String>, Vec<Tx>) = {
+        let map = room_map.lock().unwrap();
+        if let Some(peers) = map.get(room_id) {
+            let list: Vec<String> = peers.values().map(|p| p.name.clone()).collect();
+            let senders: Vec<Tx> = peers.values().map(|p| p.sender.clone()).collect();
+            (list, senders)
+        } else {
+            (Vec::new(), Vec::new())
+        }
+    };
+
+    let msg = json!({
+        "type": "participants",
+        "participants": list
+    })
+    .to_string();
+
+    print!("Broadcast Room - Participant: {:?}", msg);
+
+    for tx in senders {
+        let _ = tx.unbounded_send(Message::Text(msg.clone().into()));
+    }
+}
 
 async fn handle_connection(
-    peer_map: PeerMap,
+    room_id: String,
+    room_map: RoomMap,
+    partial_participant: PartialParticipant,
     ws_stream: WebSocketStream<TokioIo<Upgraded>>,
     addr: SocketAddr,
 ) {
-    println!("WebSocket connection established: {}", addr);
-
-    // Insert the write part of this peer to the peer map.
+    // ---- Create a sender channel for this participant ----
     let (tx, rx) = unbounded();
-    peer_map.lock().unwrap().insert(addr, tx);
 
+    // ---- Insert participant (safe now because name already validated) ----
+    {
+        let mut map = room_map.lock().unwrap();
+
+        let participant = Participant {
+            name: partial_participant.name,
+            _transcribe_to: partial_participant.transcribe_to,
+            _translate_to: partial_participant.translate_to,
+            sender: tx,
+        };
+        let participant_for_broadcast = participant.clone();
+
+        map.entry(room_id.clone()).or_default().insert(addr, participant);
+
+        println!("WebSocket connection established: {}", addr);
+
+        // -- Broadcast WS Handshake
+        broadcast_ws_handshake_success(participant_for_broadcast);
+
+        println!("====== Current Room State ======");
+        for (room, participants) in map.iter() {
+            println!("Room: {}", room);
+            for (addr, participant) in participants.iter() {
+                println!("  Addr: {:?}, Name: {}", addr, participant.name);
+            }
+        }
+        println!("================================");
+    }
+
+    // -- Broadcast Room Participant
+    broadcast_room_participants(&room_id, &room_map);
+
+    // ---- Split into outgoing/incoming streams ----
     let (outgoing, incoming) = ws_stream.split();
 
     let broadcast_incoming = incoming.try_for_each(|msg| {
-        println!("Received a message from {}: {}", addr, msg.to_text().unwrap());
-        let peers = peer_map.lock().unwrap();
+        match msg {
+            Message::Text(ref text) => {
+                println!("[Room: {}] Received a message from {}: {}", room_id, addr, text);
+            }
+            Message::Binary(ref bin) => {
+                println!("[Room: {}] Received binary from {}: {:?}", room_id, addr, bin);
+            }
+            _ => {}
+        }
 
-        // We want to broadcast the message to everyone except ourselves.
-        let broadcast_recipients =
-            peers.iter().filter(|(peer_addr, _)| peer_addr != &&addr).map(|(_, ws_sink)| ws_sink);
-
-        for recp in broadcast_recipients {
-            recp.unbounded_send(msg.clone()).unwrap();
+        let room_map = room_map.lock().unwrap();
+        if let Some(peers) = room_map.get(&room_id) {
+            for (peer_addr, participant) in peers.iter() {
+                if *peer_addr != addr {
+                    let _ = participant.sender.unbounded_send(msg.clone());
+                }
+            }
         }
 
         future::ok(())
@@ -102,72 +191,130 @@ async fn handle_connection(
     future::select(broadcast_incoming, receive_from_others).await;
 
     println!("{} disconnected", &addr);
-    peer_map.lock().unwrap().remove(&addr);
+
+    // ---- Remove participant ----
+    {
+        let mut room_map = room_map.lock().unwrap();
+        if let Some(peers) = room_map.get_mut(&room_id) {
+            peers.remove(&addr);
+        }
+    }
 }
 
 async fn handle_request(
-    peer_map: PeerMap,
     room_map: RoomMap,
     mut req: Request<Incoming>,
     addr: SocketAddr,
 ) -> Result<Response<Body>, Infallible> {
-    println!("Received a new, potentially ws handshake");
-    println!("The request's path is: {}", req.uri().path());
+    let headers = req.headers();
 
-    println!("The request's headers are:");
-    
+    // Only accept proper WebSocket handshake requests
+    if req.method() != Method::GET
+        || headers.get(SEC_WEBSOCKET_VERSION).map(|h| h != "13").unwrap_or(true)
+    {
+        return Ok(Response::new(Body::from("Hi, you are in the wrong place.")));
+    }
+
+    println!("Received a new, potentially WS Handshake");
+    println!("Request Path: {}", req.uri().path());
+
+    // Extract room_id from path
+    let mut room_id = String::from("default");
+    let uri = req.uri().to_string();
+    if let Ok(url) = Url::parse(&format!("ws://localhost{}", uri)) {
+        let path_room = url.path().trim_start_matches('/');
+        if !path_room.is_empty() {
+            room_id = path_room.to_string();
+        }
+    }
+
+    // Default participant data
+    let mut participant_name = String::from("participant-name");
+    let mut translate_to = String::from("en");
+    let mut transcribe_to = String::from("jp");
+
+    // Extract from query string
+    if let Some(query_str) = req.uri().query() {
+        let params: HashMap<_, _> =
+            form_urlencoded::parse(query_str.as_bytes()).into_owned().collect();
+
+        println!("Request Parameters: {:?}", params);
+
+        if let Some(name) = params.get("name") {
+            participant_name = name.clone();
+        }
+        if let Some(tt) = params.get("translate_to") {
+            translate_to = tt.clone();
+        }
+        if let Some(tc) = params.get("transcribe_to") {
+            transcribe_to = tc.clone();
+        }
+    }
+
+    // Reject duplicate participant name
+    {
+        let rooms_lock = room_map.lock().unwrap();
+        if let Some(room_participants) = rooms_lock.get(&room_id) {
+            if room_participants.values().any(|p: &Participant| p.name == participant_name) {
+                println!(
+                    "Cannot upgrade or proceed. Participant {} is already in the room {}",
+                    participant_name, room_id
+                );
+                let mut res = Response::new(Body::from(format!(
+                    "Name '{}' is already in use",
+                    participant_name
+                )));
+                *res.status_mut() = StatusCode::CONFLICT;
+                return Ok(res);
+            }
+        }
+    }
+
+    println!(
+        "Participant: {}, Translate to: {}, Transcribe to: {}",
+        participant_name, translate_to, transcribe_to
+    );
+
+    println!("Request Headers:");
     for (ref header, _value) in req.headers() {
         println!("* {}", header);
     }
 
-    if let Some(query_str) = req.uri().query() {
-        // Parse the query string into a key-value map
-        let params: HashMap<_, _> = form_urlencoded::parse(query_str.as_bytes())
-            .into_owned()
-            .collect();
-
-        let name = params.get("name").map(|s| s.as_str()).unwrap_or("unknown");
-        let translate_to = params.get("translate_to").map(|s| s.as_str()).unwrap_or("en");
-        let transcribe_to = params.get("transcribe_to").map(|s| s.as_str()).unwrap_or("en");
-
-        println!("Name: {}, Translate to: {}, Transcribe to: {}", name, translate_to, transcribe_to);
-
-        // Optional: print all query params
-        println!("All query params: {:?}", params);
-    }
-
-
     let upgrade = HeaderValue::from_static("Upgrade");
     let websocket = HeaderValue::from_static("websocket");
-    let headers = req.headers();
     let key = headers.get(SEC_WEBSOCKET_KEY);
     let derived = key.map(|k| derive_accept_key(k.as_bytes()));
-    
-    if req.method() != Method::GET  || !headers.get(SEC_WEBSOCKET_VERSION).map(|h| h == "13").unwrap_or(false) {
-        return Ok(Response::new(Body::from("Hello World!")));
-    }
+    let req_ver = req.version();
 
-    let ver = req.version();
+    // Upgrade the Connection
+    tokio::task::spawn(async move {
+        match hyper::upgrade::on(&mut req).await {
+            Ok(upgraded) => {
+                let upgraded = TokioIo::new(upgraded);
 
-    // tokio::task::spawn(async move {
-    //     match hyper::upgrade::on(&mut req).await {
-    //         Ok(upgraded) => {
-    //             let upgraded = TokioIo::new(upgraded);
-    //             handle_connection(
-    //                 peer_map,
-    //                 WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await,
-    //                 addr,
-    //             )
-    //             .await;
-    //         }
-    //         Err(e) => println!("upgrade error: {}", e),
-    //     }
-    // });
+                let participant_obj = PartialParticipant {
+                    name: participant_name,
+                    transcribe_to: transcribe_to,
+                    translate_to: translate_to,
+                };
+
+                handle_connection(
+                    room_id,
+                    room_map,
+                    participant_obj,
+                    WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await,
+                    addr,
+                )
+                .await;
+            }
+            Err(e) => println!("upgrade error: {}", e),
+        }
+    });
 
     let mut res = Response::new(Body::default());
 
     *res.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    *res.version_mut() = ver;
+    *res.version_mut() = req_ver;
     res.headers_mut().append(CONNECTION, upgrade);
     res.headers_mut().append(UPGRADE, websocket);
     res.headers_mut().append(SEC_WEBSOCKET_ACCEPT, derived.unwrap().parse().unwrap());
@@ -180,7 +327,6 @@ async fn handle_request(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let state = PeerMap::new(Mutex::new(HashMap::new()));
     let curr_room_state = RoomMap::new(Mutex::new(HashMap::new()));
 
     let addr =
@@ -190,21 +336,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;
-        let state = state.clone();
         let curr_room_state = curr_room_state.clone();
 
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
-
-            let service = service_fn(move |req| handle_request(
-                state.clone(),
-                curr_room_state.clone(),
-                req,
-                remote_addr
-            ));
-
+            let service =
+                service_fn(move |req| handle_request(curr_room_state.clone(), req, remote_addr));
             let conn = http1::Builder::new().serve_connection(io, service).with_upgrades();
-
             if let Err(err) = conn.await {
                 eprintln!("failed to serve connection: {err:?}");
             }

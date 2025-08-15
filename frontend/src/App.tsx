@@ -60,8 +60,7 @@ function App() {
 
 		// Pass initial settings in Sec-WebSocket-Protocol (subprotocol)
 		const socket = new WebSocket(
-			`ws://127.0.0.1:12345/${encodeURIComponent(room)}?${params.toString()}`,
-			['test_protocol_1']
+			`ws://127.0.0.1:12345/${encodeURIComponent(room)}?${params.toString()}`
 		);
 
 		socket.onopen = () => {

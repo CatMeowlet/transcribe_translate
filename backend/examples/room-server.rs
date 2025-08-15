@@ -13,12 +13,15 @@ use std::{
 };
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt, SinkExt};
+use futures_util::{future, pin_mut, stream::TryStreamExt, SinkExt, StreamExt};
 use serde_json::json;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
     accept_hdr_async,
-    tungstenite::{handshake::server::{Request, Response}, protocol::Message},
+    tungstenite::{
+        handshake::server::{Request, Response},
+        protocol::Message,
+    },
     WebSocketStream,
 };
 use tungstenite::handshake::server::ErrorResponse;
@@ -87,12 +90,7 @@ fn broadcast_participants(rooms: &RoomMap, room_id: &str) {
 }
 
 /// Handle all incoming messages from this client and broadcast them to others
-fn handle_incoming(
-    rooms: &RoomMap,
-    room_id: &str,
-    addr: SocketAddr,
-    msg: Message,
-) {
+fn handle_incoming(rooms: &RoomMap, room_id: &str, addr: SocketAddr, msg: Message) {
     let senders: Vec<Tx> = {
         let map = rooms.lock().unwrap();
         if let Some(peers) = map.get(room_id) {
@@ -119,11 +117,9 @@ where
     let _ = rx.map(Ok).forward(outgoing).await;
 }
 
-
-
 fn process_header_and_validate_participant_name(
     request: &Request,
-    rooms: &RoomMap
+    rooms: &RoomMap,
 ) -> Result<(String, String), ErrorResponse> {
     let mut room_id = String::from("default");
     let mut display_name = String::from("Anonymous");
@@ -159,17 +155,12 @@ fn process_header_and_validate_participant_name(
     Ok((room_id, display_name))
 }
 
-
-async fn handle_connection(
-    rooms: RoomMap,
-    stream: TcpStream,
-    connection_addr: SocketAddr,
-) {
+async fn handle_connection(rooms: RoomMap, stream: TcpStream, connection_addr: SocketAddr) {
     let mut room_id = String::new();
     let mut display_name = String::new();
 
     // ---- WebSocket handshake & extract room/name ----
-    let ws_stream = accept_hdr_async(stream, |req: &Request, resp: Response| { 
+    let ws_stream = accept_hdr_async(stream, |req: &Request, resp: Response| {
         match process_header_and_validate_participant_name(req, &rooms) {
             Ok((rid, dname)) => {
                 room_id = rid;
@@ -178,19 +169,28 @@ async fn handle_connection(
             }
             Err(reject_resp) => Err(reject_resp), // reject handshake here
         }
-    }).await;
+    })
+    .await;
 
     let ws_stream: WebSocketStream<TcpStream> = match ws_stream {
         Ok(stream) => {
             println!("{} joined room '{}' as '{}'", connection_addr, room_id, display_name);
             stream
-        }, 
+        }
         Err(tungstenite::Error::Http(response)) => {
             // Extract and log reason from rejection
             if let Some(reason) = response.body() {
-                println!("Rejected connection from {}: {}", connection_addr,  String::from_utf8_lossy(&reason));
+                println!(
+                    "Rejected connection from {}: {}",
+                    connection_addr,
+                    String::from_utf8_lossy(&reason)
+                );
             } else {
-                println!("Rejected connection from {} with status {}", connection_addr, response.status());
+                println!(
+                    "Rejected connection from {} with status {}",
+                    connection_addr,
+                    response.status()
+                );
             }
             return;
         }
@@ -201,20 +201,14 @@ async fn handle_connection(
     };
 
     // ---- Create a sender channel for this participant ----
-    let (tx, rx) = unbounded(); 
+    let (tx, rx) = unbounded();
 
     // ---- Insert participant (safe now because name already validated) ----
     {
         let mut map = rooms.lock().unwrap();
         map.entry(room_id.clone())
             .or_default()
-            .insert(
-                connection_addr,
-                Participant {
-                    name: display_name.clone(),
-                    sender: tx,
-                },
-            );
+            .insert(connection_addr, Participant { name: display_name.clone(), sender: tx });
 
         println!("=== Current Room State ===");
         for (room, participants) in map.iter() {
@@ -258,12 +252,10 @@ async fn handle_connection(
 
 #[tokio::main]
 async fn main() -> Result<(), IoError> {
-    let addr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let listener = TcpListener::bind(&addr).await.expect("Can't bind");
 
-    // Init Room to Empty 
+    // Init Room to Empty
     let rooms: RoomMap = Arc::new(Mutex::new(HashMap::new()));
 
     println!("Listening on {}", addr);

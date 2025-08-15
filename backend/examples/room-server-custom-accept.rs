@@ -73,48 +73,77 @@ type RoomParticipants = HashMap<SocketAddr, Participant>;
 
 type RoomMap = Arc<Mutex<HashMap<RoomName, RoomParticipants>>>;
 
-/// Collect senders for a room without holding the lock while sending
-fn collect_room_senders(room_id: &str, room_map: &RoomMap) -> Vec<Tx> {
+fn get_room_participants(room_id: &str, room_map: &RoomMap) -> Vec<Participant> {
     let map = room_map.lock().unwrap();
-    map.get(room_id)
-        .map(|peers| peers.values().map(|p| p.sender.clone()).collect())
-        .unwrap_or_default()
+    map.get(room_id).map(|peers| peers.values().map(|p| p.clone()).collect()).unwrap_or_default()
 }
 
-fn broadcast_ws_handshake_success(participant: Participant) {
-    let msg = json!({
-        "type": "message",
-        "is_success": true,
-        "message": "successfully established handshake"
-    })
-    .to_string();
+fn broadcast_ws_handshake_success(
+    curr_addr: SocketAddr,
+    curr_participant: Participant,
+    room_id: &str,
+    room_map: &RoomMap,
+) {
+    let timestamp = chrono::Utc::now().to_rfc3339();
 
-    let _ = participant.sender.unbounded_send(Message::Text(msg.clone().into()));
-}
+    // Send to owner
+    let _ = curr_participant.sender.unbounded_send(Message::Text(
+        json!({
+            "type": "ws_handshake_status",
+            "status": "connected",
+            "timestamp": timestamp,
+            "message": format!("You joined the room '{}'", room_id)
+        })
+        .to_string()
+        .into(),
+    ));
 
-fn broadcast_room_participants(room_id: &str, room_map: &RoomMap) {
-    let (list, senders): (Vec<String>, Vec<Tx>) = {
-        let map = room_map.lock().unwrap();
-        if let Some(peers) = map.get(room_id) {
-            let list: Vec<String> = peers.values().map(|p| p.name.clone()).collect();
-            let senders: Vec<Tx> = peers.values().map(|p| p.sender.clone()).collect();
-            (list, senders)
-        } else {
-            (Vec::new(), Vec::new())
-        }
-    };
+    // Collect senders for others without holding the lock
+    let other_senders: Vec<Tx> =
+        {
+            let map = room_map.lock().unwrap();
+            map.get(room_id)
+                .map(|peers| {
+                    peers
+                        .iter()
+                        .filter_map(|(peer_addr, p)| {
+                            if *peer_addr != curr_addr {
+                                Some(p.sender.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
 
-    let msg = json!({
-        "type": "participants",
-        "participants": list
-    })
-    .to_string();
-
-    print!("Broadcast Room - Participant: {:?}", msg);
-
-    for tx in senders {
-        let _ = tx.unbounded_send(Message::Text(msg.clone().into()));
+    // Send to everyone else
+    for tx in other_senders {
+        let _ = tx.unbounded_send(Message::Text(
+            json!({
+                "type": "ws_handshake_status",
+                "status": "connected",
+                "timestamp": timestamp,
+                "message": format!("{} joined the room", curr_participant.name)
+            })
+            .to_string()
+            .into(),
+        ));
     }
+}
+
+fn broadcast_ws_handshake_close(participant: Participant) {
+    let _ = participant.sender.unbounded_send(Message::Text(
+        json!({
+            "type": "ws_handshake_status",
+            "status": "closed",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "message": "successfully closed the socket"
+        })
+        .to_string()
+        .into(),
+    ));
 }
 
 async fn handle_connection(
@@ -128,36 +157,22 @@ async fn handle_connection(
     let (tx, rx) = unbounded();
 
     // ---- Insert participant (safe now because name already validated) ----
+    let participant = Participant {
+        name: partial_participant.name,
+        _transcribe_to: partial_participant.transcribe_to,
+        _translate_to: partial_participant.translate_to,
+        sender: tx,
+    };
+
+    let participant_for_broadcast = participant.clone();
+
     {
         let mut map = room_map.lock().unwrap();
-
-        let participant = Participant {
-            name: partial_participant.name,
-            _transcribe_to: partial_participant.transcribe_to,
-            _translate_to: partial_participant.translate_to,
-            sender: tx,
-        };
-        let participant_for_broadcast = participant.clone();
-
         map.entry(room_id.clone()).or_default().insert(addr, participant);
-
         println!("WebSocket connection established: {}", addr);
-
-        // -- Broadcast WS Handshake
-        broadcast_ws_handshake_success(participant_for_broadcast);
-
-        println!("====== Current Room State ======");
-        for (room, participants) in map.iter() {
-            println!("Room: {}", room);
-            for (addr, participant) in participants.iter() {
-                println!("  Addr: {:?}, Name: {}", addr, participant.name);
-            }
-        }
-        println!("================================");
     }
-
-    // -- Broadcast Room Participant
-    broadcast_room_participants(&room_id, &room_map);
+    // -- Broadcast WS Handshake
+    broadcast_ws_handshake_success(addr, participant_for_broadcast, &room_id, &room_map);
 
     // ---- Split into outgoing/incoming streams ----
     let (outgoing, incoming) = ws_stream.split();

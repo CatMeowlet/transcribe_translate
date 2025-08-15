@@ -53,6 +53,7 @@ use tokio_tungstenite::{
 type Tx = UnboundedSender<Message>;
 type Body = http_body_util::Full<hyper::body::Bytes>;
 use url::{form_urlencoded, Url};
+
 struct PartialParticipant {
     name: String,
     transcribe_to: String,
@@ -80,7 +81,7 @@ fn get_room_participants(room_id: &str, room_map: &RoomMap) -> Vec<Participant> 
 
 fn broadcast_ws_handshake_success(
     curr_addr: SocketAddr,
-    curr_participant: Participant,
+    curr_participant: &Participant,
     room_id: &str,
     room_map: &RoomMap,
 ) {
@@ -133,17 +134,59 @@ fn broadcast_ws_handshake_success(
     }
 }
 
-fn broadcast_ws_handshake_close(participant: Participant) {
-    let _ = participant.sender.unbounded_send(Message::Text(
+fn broadcast_ws_handshake_close(
+    curr_addr: SocketAddr,
+    curr_participant: &Participant,
+    room_id: &str,
+    room_map: &RoomMap,
+) {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+
+    // Send to owner
+    let _ = curr_participant.sender.unbounded_send(Message::Text(
         json!({
             "type": "ws_handshake_status",
-            "status": "closed",
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "message": "successfully closed the socket"
+            "status": "close",
+            "timestamp": timestamp,
+            "message": format!("You left the room '{}'", room_id)
         })
         .to_string()
         .into(),
     ));
+
+    // Collect senders for others without holding the lock
+    let other_senders: Vec<Tx> =
+        {
+            let map = room_map.lock().unwrap();
+            map.get(room_id)
+                .map(|peers| {
+                    peers
+                        .iter()
+                        .filter_map(|(peer_addr, p)| {
+                            if *peer_addr != curr_addr {
+                                Some(p.sender.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+    // Send to everyone else
+    for tx in other_senders {
+        let _ = tx.unbounded_send(Message::Text(
+            json!({
+                "type": "ws_handshake_status",
+                "status": "close",
+                "timestamp": timestamp,
+                "message": format!("{} left the room", curr_participant.name)
+            })
+            .to_string()
+            .into(),
+        ));
+    }
 }
 
 async fn handle_connection(
@@ -172,7 +215,7 @@ async fn handle_connection(
         println!("WebSocket connection established: {}", addr);
     }
     // -- Broadcast WS Handshake
-    broadcast_ws_handshake_success(addr, participant_for_broadcast, &room_id, &room_map);
+    broadcast_ws_handshake_success(addr, &participant_for_broadcast, &room_id, &room_map);
 
     // ---- Split into outgoing/incoming streams ----
     let (outgoing, incoming) = ws_stream.split();
@@ -206,6 +249,9 @@ async fn handle_connection(
     future::select(broadcast_incoming, receive_from_others).await;
 
     println!("{} disconnected", &addr);
+
+    // -- Broadcast WS Handshake - Close
+    broadcast_ws_handshake_close(addr, &participant_for_broadcast, &room_id, &room_map);
 
     // ---- Remove participant ----
     {

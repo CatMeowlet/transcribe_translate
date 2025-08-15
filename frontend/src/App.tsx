@@ -41,6 +41,7 @@ function App() {
 	const [translateTo, setTranslateTo] = useState('en');
 	const [transcribeTo, setTranscribeTo] = useState('en');
 	const [ws, setWs] = useState<WebSocket | null>(null);
+	const [wsConnected, setWsConnected] = useState<boolean>(false);
 
 	useEffect(() => {
 		setDisplayName(_handleGenerateRandomDisplayName());
@@ -58,7 +59,6 @@ function App() {
 			transcribe_to: transcribeTo,
 		});
 
-		// Pass initial settings in Sec-WebSocket-Protocol (subprotocol)
 		const socket = new WebSocket(
 			`ws://127.0.0.1:12345/${encodeURIComponent(room)}?${params.toString()}`
 		);
@@ -72,8 +72,22 @@ function App() {
 
 			try {
 				const data = JSON.parse(event.data);
+
+				switch (data?.type?.toLowerCase()) {
+					case 'ws_handshake_status': {
+						if (data?.status?.toLowerCase() === 'connected') {
+							setWsConnected(true);
+						}
+						break;
+					}
+				}
+
 				if (data.type === 'count') {
 					console.log('Participants:', data.count);
+				}
+
+				if (data?.message) {
+					console.log('message: ', data?.message);
 				}
 			} catch {
 				console.warn('Received non-JSON message:', event.data);
@@ -82,6 +96,8 @@ function App() {
 
 		socket.onclose = () => {
 			console.log(`Disconnected from room: ${room}`);
+			setWsConnected(false);
+			setWs(null);
 		};
 
 		socket.onerror = (err) => {
@@ -89,6 +105,14 @@ function App() {
 		};
 
 		setWs(socket);
+	};
+
+	const disconnectFromRoom = () => {
+		if (ws) {
+			ws.close();
+			setWs(null);
+			setWsConnected(false);
+		}
 	};
 
 	return (
@@ -118,7 +142,16 @@ function App() {
 					placeholder='Transcribe to...'
 					className='w-32'
 				/>
-				<Button onClick={connectToRoom}>Connect</Button>
+				<Button onClick={connectToRoom} disabled={wsConnected}>
+					Connect
+				</Button>
+				<Button
+					variant='destructive'
+					onClick={disconnectFromRoom}
+					disabled={!wsConnected}
+				>
+					Disconnect
+				</Button>
 			</div>
 		</div>
 	);
